@@ -15,6 +15,8 @@ import functools
 import logging
 import uuid
 
+from boto.s3.connection import S3Connection
+from boto.s3.key import Key
 import pytz
 
 from django.conf import settings
@@ -391,7 +393,7 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         encrypted_img_data = self._encrypt_image_data(img_data, aes_key)
         b64_encoded_img_data = base64.encodestring(encrypted_img_data)
 
-        # Upload it to S3
+        self.write_data("face", b64_encoded_img_data)
 
     @status_before_must_be("created")
     def upload_photo_id_image(self, img_data):
@@ -400,9 +402,34 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         b64_encoded_img_data = base64.encodestring(encrypted_img_data)
 
         # Upload this to S3
-
         rsa_key = RSA.importKey(
             settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
         )
         rsa_cipher = PKCS1_OAEP.new(key)
         rsa_encrypted_aes_key = rsa_cipher.encrypt(aes_key)
+
+        self.write_data("photo_id", b64_encoded_img_data)
+
+    def _write_data(name, data):
+        """
+        Write data into an S3 bucket based on a `name` prefix and this object's
+        `receipt_id` attribute (`name` + "/" + `receipt_id`). For example::
+
+          face/4dd1add9-6719-42f7-bea0-115c008c4fca
+        """
+        self._generate_key(name).set_contents_from_string(data)
+
+    def _delete_data(name):
+        self._generate_key(name).delete()
+
+    def _generate_key(prefix):
+        conn = S3Connection(
+            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_ACCESS_KEY"],
+            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_SECRET_KEY"]
+        )
+        bucket = conn.get_bucket(VERIFY_STUDENT["SOFTWARE_SECURE"]["S3_BUCKET"])
+
+        key = Key(bucket)
+        k.key = "{}/{}".format(prefix, self.receipt_id);
+
+        return key
