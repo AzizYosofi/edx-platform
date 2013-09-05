@@ -115,7 +115,14 @@ def create_order(request):
     """
     if not SoftwareSecurePhotoVerification.user_has_valid_or_pending(request.user):
         attempt = SoftwareSecurePhotoVerification(user=request.user)
-        attempt.status = "ready"
+        b64_face_image = request.POST['face_image'].split(",")[1]
+        b64_photo_id_image = request.POST['photo_id_image'].split(",")[1]
+
+        attempt.upload_face_image(b64_face_image.decode('base64'))
+        attempt.upload_photo_id_image(b64_photo_id_image.decode('base64'))
+        attempt.mark_ready()
+
+        headers, body = attempt.create_request()
         attempt.save()
 
     course_id = request.POST['course_id']

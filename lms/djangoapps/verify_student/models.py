@@ -9,6 +9,7 @@ of a student over a period of time. Right now, the only models are the abstract
 photo verification process as generic as possible.
 """
 from datetime import datetime, timedelta
+from email.utils import formatdate
 from hashlib import md5
 import base64
 import functools
@@ -19,14 +20,17 @@ from boto.s3.connection import S3Connection
 from boto.s3.key import Key
 import pytz
 
+
 from django.conf import settings
 from django.db import models
 from django.contrib.auth.models import User
+from django.core.urlresolvers import reverse
 from model_utils.models import StatusModel
 from model_utils import Choices
 
 from verify_student.ssencrypt import (
-    random_aes_key, decode_and_decrypt, encrypt_and_encode
+    random_aes_key, decode_and_decrypt, encrypt_and_encode,
+    generate_signed_message, rsa_encrypt
 )
 
 log = logging.getLogger(__name__)
@@ -261,12 +265,10 @@ class PhotoVerification(StatusModel):
         self.save()
 
     @status_before_must_be("ready", "submit")
-    def submit(self, reviewing_service=None):
+    def submit(self):
         if self.status == "submitted":
             return
 
-        if reviewing_service:
-            reviewing_service.submit(self)
         self.submitted_at = datetime.now(pytz.UTC)
         self.status = "submitted"
         self.save()
@@ -390,46 +392,61 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
     def upload_face_image(self, img_data):
         aes_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["FACE_IMAGE_AES_KEY"]
         aes_key = aes_key_str.decode("hex")
-        encrypted_img_data = self._encrypt_image_data(img_data, aes_key)
-        b64_encoded_img_data = base64.encodestring(encrypted_img_data)
 
-        self.write_data("face", b64_encoded_img_data)
+        s3_key = self._generate_key("face")
+        s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
+
+        self.face_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
 
     @status_before_must_be("created")
     def upload_photo_id_image(self, img_data):
         aes_key = random_aes_key()
-        encrypted_img_data = self._encrypt_image_data(img_data, aes_key)
-        b64_encoded_img_data = base64.encodestring(encrypted_img_data)
+        rsa_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
+        rsa_encrypted_aes_key = rsa_encrypt(aes_key, rsa_key_str)
 
         # Upload this to S3
-        rsa_key = RSA.importKey(
-            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
-        )
-        rsa_cipher = PKCS1_OAEP.new(key)
-        rsa_encrypted_aes_key = rsa_cipher.encrypt(aes_key)
+        s3_key = self._generate_key("photo_id")
+        s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
 
-        self.write_data("photo_id", b64_encoded_img_data)
+        # Update our record fields
+        self.photo_id_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
+        self.photo_id_key = rsa_encrypted_aes_key.encode('base64')
 
-    def _write_data(name, data):
+    def _generate_key(self, prefix):
         """
-        Write data into an S3 bucket based on a `name` prefix and this object's
-        `receipt_id` attribute (`name` + "/" + `receipt_id`). For example::
-
-          face/4dd1add9-6719-42f7-bea0-115c008c4fca
+        face/4dd1add9-6719-42f7-bea0-115c008c4fca
         """
-        self._generate_key(name).set_contents_from_string(data)
-
-    def _delete_data(name):
-        self._generate_key(name).delete()
-
-    def _generate_key(prefix):
         conn = S3Connection(
             settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_ACCESS_KEY"],
             settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_SECRET_KEY"]
         )
-        bucket = conn.get_bucket(VERIFY_STUDENT["SOFTWARE_SECURE"]["S3_BUCKET"])
+        bucket = conn.get_bucket(settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["S3_BUCKET"])
 
         key = Key(bucket)
-        k.key = "{}/{}".format(prefix, self.receipt_id);
+        key.key = "{}/{}".format(prefix, self.receipt_id);
 
         return key
+
+    def create_request(self):
+        """return headers, body_dict"""
+        access_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_ACCESS_KEY"]
+        secret_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_SECRET_KEY"]
+
+        body = {
+            "EdX-ID": str(self.receipt_id),
+            "UserPhoto": self.face_image_url,
+            "PhotoID": self.photo_id_image_url,
+            "PhotoIDKey": self.photo_id_key,
+            "Expected Name": self.user.profile.name,
+            "sendResponseTo": "https://fake.edx.org/postback"
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Date": formatdate(timeval=None, localtime=False, usegmt=True)
+        }
+        message, _, authorization = generate_signed_message(
+            "POST", headers, body, access_key, secret_key
+        )
+        headers['Authorization'] = authorization
+
+        return headers, body

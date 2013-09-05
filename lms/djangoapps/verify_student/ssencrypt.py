@@ -172,6 +172,7 @@ def sample_signed_message(access_key, secret_key):
         "PhotoID" : "s3://also.not.read.edx.org",
         "PhotoIDKey" : "",
         "Expected Name" : "John Doe",
+        "" : "http://foo.edx.org"
     }
     headers_dict = {
         'Content-Type' : 'application/json',
