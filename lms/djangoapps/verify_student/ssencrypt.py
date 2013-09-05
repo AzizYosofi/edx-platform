@@ -165,33 +165,3 @@ def body_string(body_dict):
 
     return "".join(body_list) # Note that trailing \n's are important
 
-def sample_signed_message(access_key, secret_key):
-    body_dict = {
-        "EdX-ID" : str(uuid4()),
-        "UserPhoto" : "s3://not.real.edx.org",
-        "PhotoID" : "s3://also.not.read.edx.org",
-        "PhotoIDKey" : "",
-        "Expected Name" : "John Doe",
-        "" : "http://foo.edx.org"
-    }
-    headers_dict = {
-        'Content-Type' : 'application/json',
-        'Date' : formatdate(timeval=None, localtime=False, usegmt=True),
-    }
-    message, _, authorization = generate_signed_message(
-        "POST", headers_dict, body_dict, access_key, secret_key
-    )
-    headers_dict['Authorization'] = authorization
-
-    for header, value in sorted(headers_dict.items()):
-        print u"{}: {}".format(header, value)
-
-    print
-    print json.dumps(body_dict, indent=2)
-    print
-
-
-if __name__ == '__main__':
-    # Call like: ssencrypt {access_key} {secret_key}
-    access_key, secret_key = sys.argv[1], sys.argv[2]
-    sample_signed_message(access_key, secret_key)
