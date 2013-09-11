@@ -8,6 +8,9 @@ import time
 
 from smtplib import SMTPServerDisconnected, SMTPDataError, SMTPConnectError
 
+from boto.ses.exceptions import SESDailyQuotaExceededError, SESMaxSendingRateExceededError, SESError
+from boto.exception import AWSConnectionError  # TODO: PleaseRetryException: figure this out
+
 from django.conf import settings
 from django.contrib.auth.models import User, Group
 from django.core.mail import EmailMultiAlternatives, get_connection
@@ -214,7 +217,13 @@ def _send_course_email(email_id, to_list, course_title, course_url, image_url, t
         connection.close()
         return course_email_result(num_sent, num_error, num_optout)
 
-    except (SMTPDataError, SMTPConnectError, SMTPServerDisconnected) as exc:
+    except (
+            SMTPDataError,
+            SMTPConnectError,
+            SMTPServerDisconnected,
+            SESMaxSendingRateExceededError,
+            AWSConnectionError
+    ) as exc:
         # Error caught here cause the email to be retried.  The entire task is actually retried without popping the list
         # Reasoning is that all of these errors may be temporary condition.
         log.warning('Email with id %d not delivered due to temporary error %s, retrying send to %d recipients',
@@ -231,10 +240,30 @@ def _send_course_email(email_id, to_list, course_title, course_url, image_url, t
             exc=exc,
             countdown=(2 ** current_task.request.retries) * 15
         )
+    except SESDailyQuotaExceededError:
+        log.exception('WARNING: Course %s exceeded SES daily quota!', course_title)
+        log.exception('Email with id %d not sent due to exceeding SES daily quota. To list: %s',
+                      email_id,
+                      [i['email'] for i in to_list])
+        # TODO: This should trigger an alert to display on the instructor dashboard, if possible
+        #  (maybe something about contacting administrator? this is somewhat serious error)
+        connection.close()
+        raise
+
+    except SESError:
+        log.exception('Course %s email resulted in SES error on sending.', course_title)
+        log.exception('Email with id %d not sent due to SES error. To list: %s',
+                      email_id,
+                      [i['email'] for i in to_list])
+        # Should this trigger an alert to display on the instructor dashboard?
+        connection.close()
+        raise
+
     except:
         log.exception('Email with id %d caused course_email task to fail with uncaught exception. To list: %s',
                       email_id,
                       [i['email'] for i in to_list])
+        # Should this trigger an alert to display on the instructor dashboard?
         # Close the connection before we exit
         connection.close()
         raise
