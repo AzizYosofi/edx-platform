@@ -12,6 +12,8 @@ from django.conf import settings
 from django.core.urlresolvers import reverse
 from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseRedirect
 from django.shortcuts import redirect
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 from django.views.generic.base import View
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext as _
@@ -26,6 +28,7 @@ from shoppingcart.processors.CyberSource import (
     get_signed_purchase_params, get_purchase_endpoint
 )
 from verify_student.models import SoftwareSecurePhotoVerification
+import ssencrypt
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +126,9 @@ def create_order(request):
         attempt.mark_ready()
 
         headers, body = attempt.create_request()
+
+        print attempt.request_message_txt()
+
         attempt.save()
 
     course_id = request.POST['course_id']
@@ -156,6 +162,43 @@ def create_order(request):
 
     return HttpResponse(json.dumps(params), content_type="text/json")
 
+@require_POST
+@csrf_exempt # SS does its own message signing, and their API won't have a cookie value
+def results_callback(request):
+    """
+    Software Secure will call this callback to tell us whether a user is
+    verified to be who they said they are.
+    """
+    body = request.body
+    body_dict = json.loads(body)
+    headers = {
+        "Authorization": request.META.get("HTTP_AUTHORIZATION", ""),
+        "Date": request.META.get("HTTP_DATE", "")
+    }
+
+    sig_valid = ssencrypt.has_valid_signature(
+        "POST",
+        headers,
+        body_dict,
+        settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_ACCESS_KEY"],
+        settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_SECRET_KEY"]
+    )
+
+    if not sig_valid:
+        return HttpResponseBadRequest(_("Signature is invalid"))
+
+    receipt_id = body_dict.get("EdX-ID")
+    passed = body_dict.get("Result") == "PASS"
+    reason = body_dict.get("Reason", "")
+    error_code = body_dict.get("MessageType", "")
+
+    attempt = SoftwareSecurePhotoVerification.objects.get(receipt_id=receipt_id)
+    if passed:
+        attempt.approve()
+    else:
+        attempt.deny(reason, error_code=error_code)
+
+    return HttpResponse("OK!")
 
 @login_required
 def show_requirements(request, course_id):
@@ -178,7 +221,6 @@ def show_requirements(request, course_id):
 
 def show_verification_page(request):
     pass
-
 
 def enroll(user, course_id, mode_slug):
     """
@@ -220,7 +262,6 @@ def enroll(user, course_id, mode_slug):
             # Create an order
             # Create a VerifiedCertificate order item
             return HttpResponse.Redirect(reverse('verified'))
-
 
     # There's always at least one mode available (default is "honor"). If they
     # haven't specified a mode, we just assume it's

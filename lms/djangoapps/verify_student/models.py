@@ -13,15 +13,17 @@ from email.utils import formatdate
 from hashlib import md5
 import base64
 import functools
+import json
 import logging
 import uuid
 
 from boto.s3.connection import S3Connection
 from boto.s3.key import Key
 import pytz
-
+import requests
 
 from django.conf import settings
+from django.core.urlresolvers import reverse
 from django.db import models
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
@@ -92,6 +94,9 @@ class PhotoVerification(StatusModel):
     `submitted`
         Submitted for review. The review may be done by a staff member or an
         external service. The user cannot make changes once in this state.
+    `must_retry`
+        We submitted this, but there was an error on submission (i.e. we did not
+        get a 200 when we POSTed to Software Secure)
     `approved`
         An admin or an external service has confirmed that the user's photo and
         photo ID match up, and that the photo ID's name matches the user's.
@@ -112,7 +117,7 @@ class PhotoVerification(StatusModel):
 
     ######################## Fields Set During Creation ########################
     # See class docstring for description of status states
-    STATUS = Choices('created', 'ready', 'submitted', 'approved', 'denied')
+    STATUS = Choices('created', 'ready', 'submitted', 'must_retry' 'approved', 'denied')
     user = models.ForeignKey(User, db_index=True)
 
     # They can change their name later on, so we want to copy the value here so
@@ -189,7 +194,7 @@ class PhotoVerification(StatusModel):
         """
         TODO: eliminate duplication with user_is_verified
         """
-        valid_statuses = ['ready', 'submitted', 'approved']
+        valid_statuses = ['must_retry', 'submitted', 'approved']
         earliest_allowed_date = (
             earliest_allowed_date or
             datetime.now(pytz.UTC) - timedelta(days=cls.DAYS_GOOD_FOR)
@@ -252,10 +257,10 @@ class PhotoVerification(StatusModel):
             they uploaded are good. Note that we don't actually do a submission
             anywhere yet.
         """
-        if not self.face_image_url:
-            raise VerificationException("No face image was uploaded.")
-        if not self.photo_id_image_url:
-            raise VerificationException("No photo ID image was uploaded.")
+        # if not self.face_image_url:
+        #     raise VerificationException("No face image was uploaded.")
+        # if not self.photo_id_image_url:
+        #     raise VerificationException("No photo ID image was uploaded.")
 
         # At any point prior to this, they can change their names via their
         # student dashboard. But at this point, we lock the value into the
@@ -264,16 +269,11 @@ class PhotoVerification(StatusModel):
         self.status = "ready"
         self.save()
 
-    @status_before_must_be("ready", "submit")
+    @status_before_must_be("must_retry", "ready", "submit")
     def submit(self):
-        if self.status == "submitted":
-            return
+        raise NotImplementedError
 
-        self.submitted_at = datetime.now(pytz.UTC)
-        self.status = "submitted"
-        self.save()
-
-    @status_before_must_be("submitted", "approved", "denied")
+    @status_before_must_be("must_retry", "submitted", "approved", "denied")
     def approve(self, user_id=None, service=""):
         """
         Approve this attempt. `user_id`
@@ -313,7 +313,7 @@ class PhotoVerification(StatusModel):
         self.status = "approved"
         self.save()
 
-    @status_before_must_be("submitted", "approved", "denied")
+    @status_before_must_be("must_retry", "submitted", "approved", "denied")
     def deny(self,
              error_msg,
              error_code="",
@@ -388,6 +388,8 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
     # encode that. The result is saved here. Actual expected length is 344.
     photo_id_key = models.TextField(max_length=1024)
 
+    IMAGE_LINK_DURATION = 5 * 60 * 60 * 24 # 5 days in seconds
+
     @status_before_must_be("created")
     def upload_face_image(self, img_data):
         aes_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["FACE_IMAGE_AES_KEY"]
@@ -396,7 +398,7 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         s3_key = self._generate_key("face")
         s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
 
-        self.face_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
+        # self.face_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
 
     @status_before_must_be("created")
     def upload_photo_id_image(self, img_data):
@@ -409,8 +411,30 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
 
         # Update our record fields
-        self.photo_id_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
         self.photo_id_key = rsa_encrypted_aes_key.encode('base64')
+        # self.photo_id_image_url = s3_key.generate_url(5 * 60 * 60 * 24)
+
+    @status_before_must_be("must_retry", "ready", "submit")
+    def submit(self):
+        try:
+            response = self.send_request()
+            if response.ok:
+                self.submitted_at = datetime.now(pytz.UTC)
+                self.status = "submitted"
+                self.save()
+            else:
+                self.status = "must_retry"
+                self.save()
+        except Exception as e:
+            log.exception(e)
+
+    def image_url(self, name):
+        """
+        We dynamically generate this, since we want it the expiration clock to
+        start when the message is created, not when the record is created.
+        """
+        s3_key = self._generate_key(name)
+        return s3_key.generate_url(self.IMAGE_LINK_DURATION)
 
     def _generate_key(self, prefix):
         """
@@ -427,18 +451,38 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
 
         return key
 
+    def _encrypted_user_photo_key_str(self):
+        """
+        Software Secure needs to have both UserPhoto and PhotoID decrypted in
+        the same manner. So even though this is going to be the same for every
+        request, we're also using RSA encryption to encrypt the AES key for
+        faces.
+        """
+        face_aes_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["FACE_IMAGE_AES_KEY"]
+        face_aes_key = face_aes_key_str.decode("hex")
+        rsa_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
+        rsa_encrypted_face_aes_key = rsa_encrypt(face_aes_key, rsa_key_str)
+
+        return rsa_encrypted_face_aes_key.encode("base64")
+
     def create_request(self):
         """return headers, body_dict"""
         access_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_ACCESS_KEY"]
         secret_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_SECRET_KEY"]
 
+        scheme = "https" if settings.HTTPS == "on" else "http"
+        callback_url = "{}://{}{}".format(
+            scheme, settings.SITE_NAME, reverse('verify_student_results_callback')
+        )
+
         body = {
             "EdX-ID": str(self.receipt_id),
-            "UserPhoto": self.face_image_url,
-            "PhotoID": self.photo_id_image_url,
+            "ExpectedName": self.user.profile.name,
+            "PhotoID": self.image_url("photo_id"),
             "PhotoIDKey": self.photo_id_key,
-            "Expected Name": self.user.profile.name,
-            "sendResponseTo": "https://fake.edx.org/postback"
+            "SendResponseTo": callback_url,
+            "UserPhoto": self.image_url("face"),
+            "UserPhotoKey": self._encrypted_user_photo_key_str(),
         }
         headers = {
             "Content-Type": "application/json",
@@ -450,3 +494,21 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         headers['Authorization'] = authorization
 
         return headers, body
+
+    def request_message_txt(self):
+        headers, body = self.create_request()
+
+        header_txt = "\n".join(
+            "{}: {}".format(h, v) for h,v in sorted(headers.items())
+        )
+        body_txt = json.dumps(body, indent=2, sort_keys=True)
+
+        return header_txt + "\n\n" + body_txt
+
+    def send_request(self):
+        headers, body = self.create_request()
+        return requests.post(
+            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_URL"],
+            headers=headers,
+            data=json.dumps(body, indent=2, sort_keys=True)
+        )

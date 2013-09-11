@@ -113,12 +113,12 @@ def has_valid_signature(method, headers_dict, body_dict, access_key, secret_key)
 
     if post_access_key != access_key:
         log.error("Posted access key does not match ours")
-        log.debug("Their access: %s; Our access: %s", (post_access_key, access_key))
+        log.debug("Their access: %s; Our access: %s", post_access_key, access_key)
         return False
 
     if post_signature != expected_signature:
         log.error("Posted signature does not match expected")
-        log.debug("Their sig: %s; Expected: %s", (post_signature, expected_signature))
+        log.debug("Their sig: %s; Expected: %s", post_signature, expected_signature)
         return False
 
     return True
